@@ -10,6 +10,8 @@
 #define ROOMS_H "/secure/include/rooms.h"
 #define SECRETS_H "/secure/include/secrets.h"
 
+#define PLANETMAP_D "/daemon/planetmap"
+
 #include CONFIG_H
 #include <lib.h>
 
