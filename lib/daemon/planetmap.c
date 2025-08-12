@@ -1,21 +1,9 @@
 /* /daemon/planetmap.c
    Procedural planet generator with deltas + hydrology (rivers/lakes)
-   For Dead Souls MUD
+   + BakeHydrology and export helpers.
 
-   Features:
-   - Per-planet procedural height, moisture, temperature, biome.
-   - Permanent + temporary delta layers saved per-planet.
-   - Hydrology: flow target, flow accumulation, river and lake detection.
-   - Simple memoization caches for performance.
-   - Admin helpers to inspect tiles.
-
-   Notes:
-   - This version uses simple Perlin-like noise functions (good for prototyping).
-   - Hydrology algorithm: each tile points to the lowest adjacent neighbor (8-way).
-     Flow accumulation is the number of upstream tiles whose path passes through that tile.
-     If a flow path reaches sea -> drained. If flow path enters a loop/not reaching sea -> basin/lake.
-     River tiles are those whose accumulation >= RIVER_ACCUM_THRESHOLD.
-   - For very large planets consider chunking / LRU caching later.
+   Place this file in /daemon/planetmap.c in your Dead Souls fork.
+   WARNING: Baking entire large planets can be CPU intensive.
 */
 
 #include <lib.h>
@@ -26,22 +14,29 @@ inherit LIB_DAEMON;
 #define PERMA_PREFIX "perma_"
 #define TEMP_PREFIX  "temp_"
 
-/* tuning constants */
+/* tuning */
 #define DEFAULT_OCTAVES 5
-#define RIVER_ACCUM_THRESHOLD 40  /* upstream tiles required to mark tile as a river */
-#define MAX_FLOW_RECURSION 10000  /* protect DFS from pathological loops */
+#define RIVER_ACCUM_THRESHOLD 40
+#define MAX_FLOW_RECURSION 10000
 
-/* persistent storage */
-private mapping Planets;         /* planet_id -> params mapping */
-private mapping PermanentDeltas; /* planet_hash -> mapping("x,y" -> mapping) */
-private mapping TemporaryDeltas; /* planet_hash -> mapping("x,y" -> mapping) */
+/* persistent */
+private mapping Planets;
+private mapping PermanentDeltas;
+private mapping TemporaryDeltas;
 
-/* runtime caches (not persisted) */
-private mapping value_cache;     /* key -> numeric value (height/temp/moist/...) */
-private mapping flow_cache;      /* "ph:x,y" -> ({ tx, ty }) or "sea" or "loop" or "pool" */
-private mapping accum_cache;     /* "ph:x,y" -> integer accumulation count */
-private mapping water_mask;      /* "ph:x,y" -> "river"/"lake"/0 */
+/* runtime caches */
+private mapping value_cache;
+private mapping flow_cache;
+private mapping accum_cache;
+private mapping water_mask;
 
+/* neighbour offsets */
+static int *NX = ({ -1, 1, 0, 0, -1, 1, -1, 1 });
+static int *NY = ({ 0, 0, -1, 1, -1, -1, 1, 1 });
+
+/* -------------------------
+   create()
+   ------------------------- */
 static void create() {
     daemon::create();
     Planets = ([]);
@@ -52,15 +47,14 @@ static void create() {
     accum_cache = ([]);
     water_mask = ([]);
 
-    /* make save dir if missing */
     if (file_size(SAVE_DIR) != -2) mkdir(SAVE_DIR);
 
-    /* default planets (example); use AddPlanet to add your own */
+    /* example planets */
     AddPlanet("earthlike", ([
         "type"        : "earthlike",
         "seed"        : 42,
-        "width"       : 400,
-        "height"      : 200,
+        "width"       : 200,
+        "height"      : 100,
         "axial_tilt"  : 23.5,
         "sea_level"   : 0.50,
         "base_temp"   : 15.0,
@@ -70,27 +64,11 @@ static void create() {
         "moisture_scale": 0.02,
         "moisture_sea_influence_radius": 24,
     ]));
-
-    AddPlanet("hot_desert", ([
-        "type"        : "hot_desert",
-        "seed"        : 777,
-        "width"       : 300,
-        "height"      : 150,
-        "axial_tilt"  : 10.0,
-        "sea_level"   : 0.20,
-        "base_temp"   : 30.0,
-        "max_elev_m"  : 6000,
-        "lapse_rate"  : 6.0,
-        "noise_scale" : 0.01,
-        "moisture_scale": 0.03,
-        "moisture_sea_influence_radius": 18,
-    ]));
 }
 
 /* -------------------------
-   Persistence helpers: per-planet saves for deltas
+   Persistence helpers
    ------------------------- */
-
 string planet_hash(mapping P) {
     if (!mapp(P)) return "none";
     string raw = P["type"] + ":" + to_string(P["seed"]);
@@ -101,9 +79,8 @@ string planet_hash(mapping P) {
     }
     return sprintf("%08x", h & 0xffffffff);
 }
-
-string perma_file_for(string phash) { return SAVE_DIR + PERMA_PREFIX + phash; }
-string temp_file_for(string phash)  { return SAVE_DIR + TEMP_PREFIX + phash; }
+string perma_file_for(string phash) { return SAVE_DIR + "perma_" + phash; }
+string temp_file_for(string phash)  { return SAVE_DIR + "temp_" + phash; }
 
 void save_planet_deltas(string phash) {
     if (!stringp(phash)) return;
@@ -125,10 +102,8 @@ void load_planet_deltas(string phash) {
 /* -------------------------
    Planet management
    ------------------------- */
-
 mixed AddPlanet(string name, mapping params) {
     if (!stringp(name) || !mapp(params)) return 0;
-    /* normalize params: require seed,width,height */
     if (!params["seed"]) params["seed"] = 0;
     if (!params["width"] || !params["height"]) return 0;
     params["type"] = name;
@@ -137,60 +112,38 @@ mixed AddPlanet(string name, mapping params) {
     if (!mapp(PermanentDeltas[ph])) PermanentDeltas[ph] = ([]);
     if (!mapp(TemporaryDeltas[ph])) TemporaryDeltas[ph] = ([]);
     load_planet_deltas(ph);
-    /* clear caches touching this planet */
-    foreach (string k in keys(value_cache)) {
-        if (strsrch(k, ph + ":") == 0) map_delete(value_cache, k);
-    }
-    foreach (string k in keys(flow_cache)) {
-        if (strsrch(k, ph + ":") == 0) map_delete(flow_cache, k);
-    }
-    foreach (string k in keys(accum_cache)) {
-        if (strsrch(k, ph + ":") == 0) map_delete(accum_cache, k);
-    }
-    foreach (string k in keys(water_mask)) {
-        if (strsrch(k, ph + ":") == 0) map_delete(water_mask, k);
-    }
+    ClearCaches(name);
     return ph;
 }
-
 mapping GetPlanet(string name) { return Planets[name]; }
 string *ListPlanets() { return keys(Planets); }
 
 /* -------------------------
-   Perlin-like noise (prototype)
-   - hash_noise -> smooth_noise -> fractal fBm
+   Perlin-ish noise utilities
    ------------------------- */
-
 static float hash_noise(int x, int y, int seed) {
     int n = x + y * 57 + seed * 131;
     n = (n << 13) ^ n;
     float v = 1.0 - (( (n * (n * n * 15731 + 789221) + 1376312589) & 0x7fffffff) / 1073741824.0);
     return v;
 }
-
 static float smooth_noise(float x, float y, int seed) {
     int xi = to_int(floor(x));
     int yi = to_int(floor(y));
-    float fracX = x - xi;
-    float fracY = y - yi;
+    float fx = x - xi;
+    float fy = y - yi;
 
     float v1 = hash_noise(xi, yi, seed);
     float v2 = hash_noise(xi+1, yi, seed);
     float v3 = hash_noise(xi, yi+1, seed);
     float v4 = hash_noise(xi+1, yi+1, seed);
 
-    float i1 = v1 + fracX * (v2 - v1);
-    float i2 = v3 + fracX * (v4 - v3);
-    return i1 + fracY * (i2 - i1);
+    float i1 = v1 + fx * (v2 - v1);
+    float i2 = v3 + fx * (v4 - v3);
+    return i1 + fy * (i2 - i1);
 }
-
 static float fractal_noise(float x, float y, int seed, float base_scale, int octaves) {
-    float total = 0.0;
-    float freq = base_scale;
-    float amp = 1.0;
-    float maxAmp = 0.0;
-    float persistence = 0.5;
-
+    float total = 0.0, freq = base_scale, amp = 1.0, maxAmp = 0.0, persistence = 0.5;
     for (int i = 0; i < octaves; i++) {
         total += smooth_noise(x * freq, y * freq, seed) * amp;
         maxAmp += amp;
@@ -198,8 +151,7 @@ static float fractal_noise(float x, float y, int seed, float base_scale, int oct
         freq *= 2.0;
     }
     if (maxAmp == 0.0) return 0.0;
-    float norm = (total / maxAmp + 1.0) / 2.0; /* 0..1 */
-    return norm;
+    return (total / maxAmp + 1.0) / 2.0;
 }
 
 /* -------------------------
@@ -208,47 +160,41 @@ static float fractal_noise(float x, float y, int seed, float base_scale, int oct
 static int wrap_x(int x, mapping P) {
     int w = P["width"];
     if (!w) return x;
-    x %= w;
-    if (x < 0) x += w;
+    x %= w; if (x < 0) x += w;
     return x;
 }
 static int wrap_y(int y, mapping P) {
     int h = P["height"];
     if (!h) return y;
-    y %= h;
-    if (y < 0) y += h;
+    y %= h; if (y < 0) y += h;
     return y;
 }
 static float latitude_for_y(int y, mapping P) {
     float h = (float)P["height"];
-    return ((float)y / h - 0.5) * 180.0; /* -90..90 */
+    return ((float)y / h - 0.5) * 180.0;
 }
 
 /* -------------------------
-   Procedural tile properties (cached)
+   Cached tile properties
    ------------------------- */
-
 static string value_key(string ph, string kind, int x, int y) {
     return ph + ":" + kind + ":" + to_string(x) + "," + to_string(y);
 }
 
-/* Height 0..1 */
 float GetHeight(string planet_name, int x_in, int y_in) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return 0.0;
-    int x = wrap_x(x_in, P);
-    int y = wrap_y(y_in, P);
+    int x = wrap_x(x_in, P), y = wrap_y(y_in, P);
     string ph = planet_hash(P);
     string ck = value_key(ph, "h", x, y);
     if (!undefinedp(value_cache[ck])) return value_cache[ck];
 
     float scale = P["noise_scale"] ? P["noise_scale"] : 0.008;
     int seed = P["seed"];
-    float raw = fractal_noise((float)x, (float)y, seed, scale, DEFAULT_OCTAVES); /* 0..1 */
+    float raw = fractal_noise((float)x, (float)y, seed, scale, DEFAULT_OCTAVES);
 
-    /* latitude effect to bias poles slightly lower */
-    float lat = latitude_for_y(y, P) / 90.0; /* -1..1 */
-    float latfactor = cos(lat * PI / 2.0); /* 0..1 */
+    float lat = latitude_for_y(y, P) / 90.0;
+    float latfactor = cos(lat * PI / 2.0);
     float height = raw * (0.6 + 0.4 * latfactor);
     if (height < 0.0) height = 0.0;
     if (height > 1.0) height = 1.0;
@@ -256,12 +202,10 @@ float GetHeight(string planet_name, int x_in, int y_in) {
     return height;
 }
 
-/* Temperature in C */
 float GetTemperature(string planet_name, int x_in, int y_in) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return 0.0;
-    int x = wrap_x(x_in, P);
-    int y = wrap_y(y_in, P);
+    int x = wrap_x(x_in, P), y = wrap_y(y_in, P);
     string ph = planet_hash(P);
     string ck = value_key(ph, "t", x, y);
     if (!undefinedp(value_cache[ck])) return value_cache[ck];
@@ -269,17 +213,15 @@ float GetTemperature(string planet_name, int x_in, int y_in) {
     float base = P["base_temp"] ? P["base_temp"] : 15.0;
     float lat = latitude_for_y(y, P);
     float latrad = lat * PI / 180.0;
-    float latfactor = cos(latrad); /* 1 at equator, 0 at poles */
+    float latfactor = cos(latrad);
     float temp = base * (0.5 + 0.5 * latfactor);
 
-    /* elevation lapse */
     float elevNorm = GetHeight(planet_name, x, y);
     float max_elev = P["max_elev_m"] ? P["max_elev_m"] : 8000.0;
     float elevm = elevNorm * max_elev;
     float lapse = P["lapse_rate"] ? P["lapse_rate"] : 6.5;
     temp -= (lapse * (elevm / 1000.0));
 
-    /* ocean moderation */
     if (elevNorm <= (P["sea_level"] ? P["sea_level"] : 0.5)) {
         temp = temp * 0.85 + base * 0.15;
     }
@@ -288,21 +230,18 @@ float GetTemperature(string planet_name, int x_in, int y_in) {
     return temp;
 }
 
-/* Moisture 0..1 */
 float GetMoisture(string planet_name, int x_in, int y_in) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return 0.0;
-    int x = wrap_x(x_in, P);
-    int y = wrap_y(y_in, P);
+    int x = wrap_x(x_in, P), y = wrap_y(y_in, P);
     string ph = planet_hash(P);
     string ck = value_key(ph, "m", x, y);
     if (!undefinedp(value_cache[ck])) return value_cache[ck];
 
     float mscale = P["moisture_scale"] ? P["moisture_scale"] : 0.02;
     int seed = P["seed"] + 10000;
-    float raw = fractal_noise((float)x, (float)y, seed, mscale, 4); /* 0..1 */
+    float raw = fractal_noise((float)x, (float)y, seed, mscale, 4);
 
-    /* sea proximity */
     int prox = P["moisture_sea_influence_radius"] ? P["moisture_sea_influence_radius"] : 20;
     int dsea = distance_to_sea(planet_name, x, y, prox);
     if (dsea <= prox) {
@@ -310,11 +249,9 @@ float GetMoisture(string planet_name, int x_in, int y_in) {
         raw += (0.5 * sea_infl);
     }
 
-    /* elevation dries */
     float elev = GetHeight(planet_name, x, y);
     raw *= (1.0 - 0.4 * elev);
 
-    /* temp effect */
     float temp = GetTemperature(planet_name, x, y);
     float tf = (temp + 40.0) / 80.0;
     if (tf < 0.1) tf = 0.1;
@@ -327,7 +264,7 @@ float GetMoisture(string planet_name, int x_in, int y_in) {
     return raw;
 }
 
-/* distance to sea: expanding search up to limit */
+/* distance to sea */
 int distance_to_sea(string planet_name, int sx, int sy, int radius_limit) {
     mapping P = Planets[planet_name];
     float sea = P["sea_level"] ? P["sea_level"] : 0.5;
@@ -353,9 +290,8 @@ int distance_to_sea(string planet_name, int sx, int sy, int radius_limit) {
 }
 
 /* -------------------------
-   Biome classification (uses permanent delta override)
+   Biome classification
    ------------------------- */
-
 string GetClimateZone(string planet_name, int x, int y) {
     mapping P = Planets[planet_name];
     float lat = latitude_for_y(y, P);
@@ -373,7 +309,7 @@ string GetBiome(string planet_name, int x_in, int y_in) {
     int y = wrap_y(y_in, P);
     string ph = planet_hash(P);
 
-    /* check permanent delta biome override */
+    /* check permanent delta override */
     if (mapp(PermanentDeltas[ph])) {
         string dk = sprintf("%d,%d", x, y);
         if (mapp(PermanentDeltas[ph][dk]) && PermanentDeltas[ph][dk]["biome"]) {
@@ -387,33 +323,32 @@ string GetBiome(string planet_name, int x_in, int y_in) {
     float sea = P["sea_level"] ? P["sea_level"] : 0.5;
     string climate = GetClimateZone(planet_name, x, y);
 
-    /* water classes first */
+    /* water first */
     if (elev <= sea) {
         float depth = (sea - elev) / (sea > 0 ? sea : 1.0);
         if (depth > 0.5) return "deep_ocean";
         return "coastal_water";
     }
 
-    /* lakes/rivers override (if detected) */
+    /* water mask (river/lake) overrides non-aquatic biomes */
     string wmkey = ph + ":wm:" + sprintf("%d,%d", x, y);
-    if (!undefinedp(water_mask[wmkey])) {
+    if (!undefinedp(water_mask[wmkey]) && water_mask[wmkey]) {
         return water_mask[wmkey]; /* "river" or "lake" */
     }
 
-    /* mountain/alpine */
+    /* mountains */
     if (elev > 0.78) {
         if (temp < -8.0) return "snow_peak";
         return "alpine";
     }
 
-    /* cold/polar */
+    /* polar/cold */
     if (temp <= -12.0) return "polar_ice";
     if (temp <= 0.0) {
         if (moist < 0.25) return "tundra";
         return "taiga";
     }
 
-    /* tropical vs temperate */
     if (climate == "tropical") {
         if (moist > 0.75) return "tropical_rainforest";
         if (moist > 0.45) return "savanna";
@@ -431,21 +366,9 @@ string GetBiome(string planet_name, int x_in, int y_in) {
 }
 
 /* -------------------------
-   Hydrology
-   - Flow target: where water flows to (lowest neighbour)
-   - Flow end: sea OR loop/pool
-   - Accumulation: number of upstream tiles flowing through a tile
-   - River if accumulation >= threshold
-   - Lake if flow path loops (basin) or reaches a low pool that doesn't exit to sea
+   Hydrology core (flow, end, accumulation, water mask)
    ------------------------- */
 
-/* neighbor offsets (8-way) */
-static int *NX = ({ -1, 1, 0, 0, -1, 1, -1, 1 });
-static int *NY = ({ 0, 0, -1, 1, -1, -1, 1, 1 });
-
-/* compute flow target for a tile: returns ({ tx, ty }) or ({ "sea" }) if neighbor sea (or current already sea),
-   or ({ "pool" }) if local minimum with no lower neighbor.
-   Uses memoization per planet_phash. */
 mixed ComputeFlowTarget(string planet_name, int x_in, int y_in) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return 0;
@@ -459,23 +382,16 @@ mixed ComputeFlowTarget(string planet_name, int x_in, int y_in) {
     float sea = P["sea_level"] ? P["sea_level"] : 0.5;
     if (h <= sea) { flow_cache[fkey] = "sea"; return "sea"; }
 
-    /* find neighbor with lowest height */
     float best_h = h;
-    int best_tx = x;
-    int best_ty = y;
+    int best_tx = x, best_ty = y;
     for (int i = 0; i < sizeof(NX); i++) {
         int tx = wrap_x(x + NX[i], P);
         int ty = wrap_y(y + NY[i], P);
         float th = GetHeight(planet_name, tx, ty);
-        if (th < best_h) {
-            best_h = th;
-            best_tx = tx;
-            best_ty = ty;
-        }
+        if (th < best_h) { best_h = th; best_tx = tx; best_ty = ty; }
     }
 
     if (best_tx == x && best_ty == y) {
-        /* local minimum (pool) */
         flow_cache[fkey] = "pool";
         return "pool";
     }
@@ -484,8 +400,6 @@ mixed ComputeFlowTarget(string planet_name, int x_in, int y_in) {
     return ({ best_tx, best_ty });
 }
 
-/* follow flow until sea, pool, or loop. Return "sea", "pool", or "loop", and optionally last coordinate.
-   Also memoizes intermediate results for speed. */
 mixed DetermineFlowEnd(string planet_name, int x_in, int y_in) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return 0;
@@ -495,38 +409,28 @@ mixed DetermineFlowEnd(string planet_name, int x_in, int y_in) {
     string endkey = ph + ":end:" + sprintf("%d,%d", x0, y0);
     if (!undefinedp(flow_cache[endkey])) return flow_cache[endkey];
 
-    /* follow path, record sequence for loop detection */
     int steps = 0;
     int cx = x0, cy = y0;
-    mapping visited = ([]); /* "x,y" -> index in path */
-    string seq_key;
+    mapping visited = ([]);
     string result = 0;
     while (1) {
         steps++;
         if (steps > MAX_FLOW_RECURSION) { result = "loop"; break; }
-        seq_key = sprintf("%d,%d", cx, cy);
+        string seq_key = sprintf("%d,%d", cx, cy);
         if (visited[seq_key]) { result = "loop"; break; }
         visited[seq_key] = steps;
 
         mixed t = ComputeFlowTarget(planet_name, cx, cy);
-        if (stringp(t)) { /* "sea" or "pool" */
-            result = t; break;
-        }
+        if (stringp(t)) { result = t; break; }
         if (arrayp(t) && sizeof(t) == 2) {
             int nx = t[0], ny = t[1];
-            /* if we reach a tile that already has a cached end, use it */
             string nk = ph + ":end:" + sprintf("%d,%d", nx, ny);
-            if (!undefinedp(flow_cache[nk])) {
-                result = flow_cache[nk];
-                break;
-            }
-            cx = nx; cy = ny;
-            continue;
+            if (!undefinedp(flow_cache[nk])) { result = flow_cache[nk]; break; }
+            cx = nx; cy = ny; continue;
         }
         result = "loop"; break;
     }
 
-    /* memoize for all visited tiles the end result */
     foreach (string pcoord in keys(visited)) {
         flow_cache[ph + ":end:" + pcoord] = result;
     }
@@ -534,20 +438,15 @@ mixed DetermineFlowEnd(string planet_name, int x_in, int y_in) {
     return result;
 }
 
-/* compute accumulation recursively: accumulation(tile) = 1 + sum(accum of upstream tiles that point to tile)
-   We'll compute with memoization and by scanning neighbors to find upstream tiles.
-*/
 int ComputeAccumulation(string planet_name, int x_in, int y_in) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return 0;
-    int x = wrap_x(x_in, P);
-    int y = wrap_y(y_in, P);
+    int x = wrap_x(x_in, P), y = wrap_y(y_in, P);
     string ph = planet_hash(P);
     string akey = ph + ":acc:" + sprintf("%d,%d", x, y);
     if (!undefinedp(accum_cache[akey])) return accum_cache[akey];
 
-    /* find upstream tiles (neighbors whose flow target is this tile) */
-    int acc = 1; /* count self */
+    int acc = 1;
     for (int i = 0; i < sizeof(NX); i++) {
         int ux = wrap_x(x + NX[i], P);
         int uy = wrap_y(y + NY[i], P);
@@ -561,14 +460,10 @@ int ComputeAccumulation(string planet_name, int x_in, int y_in) {
     return acc;
 }
 
-/* Build water mask for tile: returns "river" or "lake" or 0.
-   Use DetermineFlowEnd + accumulation to decide.
-*/
 string DetermineWaterMask(string planet_name, int x_in, int y_in) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return 0;
-    int x = wrap_x(x_in, P);
-    int y = wrap_y(y_in, P);
+    int x = wrap_x(x_in, P), y = wrap_y(y_in, P);
     string ph = planet_hash(P);
     string wmkey = ph + ":wm:" + sprintf("%d,%d", x, y);
     if (!undefinedp(water_mask[wmkey])) return water_mask[wmkey];
@@ -579,19 +474,10 @@ string DetermineWaterMask(string planet_name, int x_in, int y_in) {
 
     mixed end = DetermineFlowEnd(planet_name, x, y);
     if (stringp(end) && end == "sea") {
-        /* drains to sea: check accumulation to mark river */
         int acc = ComputeAccumulation(planet_name, x, y);
-        if (acc >= RIVER_ACCUM_THRESHOLD) {
-            water_mask[wmkey] = "river";
-            return "river";
-        }
+        if (acc >= RIVER_ACCUM_THRESHOLD) { water_mask[wmkey] = "river"; return "river"; }
     } else if (stringp(end) && (end == "pool" || end == "loop")) {
-        /* basin: mark lake tiles along the cycle / pool mouth; a simple decision is to mark the tile
-           if its flow path ends in pool/loop and its accumulation is reasonably large. Simpler: mark pool tile as lake,
-           and mark upstream tiles until a threshold. For now, mark the endpoint tile(s) as lake. */
-        /* find endpoint tile(s): walk until you reach a tile whose ComputeFlowTarget returns "pool" or you detect the loop */
-        int cx = x; int cy = y;
-        int steps = 0;
+        int cx = x, cy = y, steps = 0;
         while (1) {
             steps++;
             if (steps > MAX_FLOW_RECURSION) break;
@@ -599,46 +485,34 @@ string DetermineWaterMask(string planet_name, int x_in, int y_in) {
             if (stringp(t) && (t == "pool")) {
                 string pkey = ph + ":wm:" + sprintf("%d,%d", cx, cy);
                 water_mask[pkey] = "lake";
-                water_mask[wmkey] = (wmkey == pkey) ? "lake" : 0;
-                return water_mask[wmkey] ? water_mask[wmkey] : "lake";
-            } else if (arrayp(t)) {
-                cx = t[0]; cy = t[1];
-                continue;
-            } else {
+                if (pkey == wmkey) { water_mask[wmkey] = "lake"; return "lake"; }
                 break;
-            }
+            } else if (arrayp(t)) { cx = t[0]; cy = t[1]; continue; }
+            else break;
         }
-        /* fallback: mark the original tile as lake if it seems plausible */
         int acc = ComputeAccumulation(planet_name, x, y);
-        if (acc >= 6) {
-            water_mask[wmkey] = "lake";
-            return "lake";
-        }
+        if (acc >= 6) { water_mask[wmkey] = "lake"; return "lake"; }
     }
 
     water_mask[wmkey] = 0;
     return 0;
 }
 
-/* Public helper: ensure hydrology is computed (lazy)
-   Returns mapping: { "water" : "river"/"lake"/"ocean"/0, "accum" : n, "flow_end": "sea"/"pool"/"loop" } */
 mapping GetHydrology(string planet_name, int x, int y) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return 0;
-    int xx = wrap_x(x, P);
-    int yy = wrap_y(y, P);
+    int xx = wrap_x(x, P), yy = wrap_y(y, P);
     string ph = planet_hash(P);
     string wmkey = ph + ":wm:" + sprintf("%d,%d", xx, yy);
     string w = DetermineWaterMask(planet_name, xx, yy);
     int acc = ComputeAccumulation(planet_name, xx, yy);
     mixed end = DetermineFlowEnd(planet_name, xx, yy);
-    return ([ "water": w, "accum": acc, "end": end ]);
+    return ([ "water": w, "acc": acc, "end": end ]);
 }
 
 /* -------------------------
-   Delta layer APIs (Permanent & Temporary)
+   Delta layer APIs
    ------------------------- */
-
 void SetPermanentDelta(string planet_name, int x, int y, mapping change) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return;
@@ -647,9 +521,7 @@ void SetPermanentDelta(string planet_name, int x, int y, mapping change) {
     string key = sprintf("%d,%d", wrap_x(x,P), wrap_y(y,P));
     PermanentDeltas[ph][key] = change;
     save_planet_deltas(ph);
-    /* if biome changed, clear caches for tile */
-    string vkey = value_key(ph, "b", x, y);
-    map_delete(value_cache, vkey);
+    map_delete(value_cache, ph + ":b:" + key);
     map_delete(flow_cache, ph + ":flow:" + key);
     map_delete(flow_cache, ph + ":end:" + key);
     map_delete(accum_cache, ph + ":acc:" + key);
@@ -666,15 +538,7 @@ void RemovePermanentDelta(string planet_name, int x, int y) {
     map_delete(value_cache, ph + ":b:" + key);
 }
 
-mapping QueryPermanentDelta(string planet_name, int x, int y) {
-    mapping P = Planets[planet_name];
-    if (!mapp(P)) return 0;
-    string ph = planet_hash(P);
-    string key = sprintf("%d,%d", wrap_x(x,P), wrap_y(y,P));
-    if (mapp(PermanentDeltas[ph]) && mapp(PermanentDeltas[ph][key])) return PermanentDeltas[ph][key];
-    return 0;
-}
-
+/* temporary deltas */
 void SetTemporaryDelta(string planet_name, int x, int y, mapping change) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return;
@@ -684,7 +548,6 @@ void SetTemporaryDelta(string planet_name, int x, int y, mapping change) {
     TemporaryDeltas[ph][key] = change;
     save_planet_deltas(ph);
 }
-
 void RemoveTemporaryDelta(string planet_name, int x, int y) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return;
@@ -693,7 +556,6 @@ void RemoveTemporaryDelta(string planet_name, int x, int y) {
     if (mapp(TemporaryDeltas[ph])) map_delete(TemporaryDeltas[ph], key);
     save_planet_deltas(ph);
 }
-
 mapping QueryTemporaryDelta(string planet_name, int x, int y) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return 0;
@@ -704,30 +566,119 @@ mapping QueryTemporaryDelta(string planet_name, int x, int y) {
 }
 
 /* -------------------------
-   High-level API (room-facing)
+   High-level room API
    ------------------------- */
-
 mapping GetRoomData(string planet_name, int x, int y) {
     mapping P = Planets[planet_name];
     if (!mapp(P)) return 0;
-    int xx = wrap_x(x, P);
-    int yy = wrap_y(y, P);
-
+    int xx = wrap_x(x, P), yy = wrap_y(y, P);
     mapping out = ([]);
     out["height"] = GetHeight(planet_name, xx, yy);
     out["temperature"] = GetTemperature(planet_name, xx, yy);
     out["moisture"] = GetMoisture(planet_name, xx, yy);
-    out["permanent"] = QueryPermanentDelta(planet_name, xx, yy);
+    out["permanent"] = (PermanentDeltas[planet_hash(P)] && PermanentDeltas[planet_hash(P)][sprintf("%d,%d",xx,yy)]) ? PermanentDeltas[planet_hash(P)][sprintf("%d,%d",xx,yy)] : 0;
     out["temporary"] = QueryTemporaryDelta(planet_name, xx, yy);
     out["hydrology"] = GetHydrology(planet_name, xx, yy);
-    /* biome resolves permanent delta overrides and water mask */
     out["biome"] = GetBiome(planet_name, xx, yy);
     return out;
 }
 
 /* -------------------------
-   Admin/debug helpers
+   BakeHydrology + Export helpers
    ------------------------- */
+
+/* BakeHydrology computes flow/accumulation/watermask for all tiles on a planet.
+   If export_to_file is non-zero, writes an ASCII water mask to /tmp/<planet>_water.txt
+   Returns number of tiles processed, or -1 on error.
+*/
+int BakeHydrology(string planet_name, int export_to_file) {
+    mapping P = Planets[planet_name];
+    if (!mapp(P)) return -1;
+    int w = P["width"], h = P["height"];
+    string ph = planet_hash(P);
+
+    /* clear planet caches first */
+    foreach (string k in keys(value_cache)) if (strsrch(k, ph + ":") == 0) map_delete(value_cache, k);
+    foreach (string k in keys(flow_cache)) if (strsrch(k, ph + ":") == 0) map_delete(flow_cache, k);
+    foreach (string k in keys(accum_cache)) if (strsrch(k, ph + ":") == 0) map_delete(accum_cache, k);
+    foreach (string k in keys(water_mask)) if (strsrch(k, ph + ":") == 0) map_delete(water_mask, k);
+
+    int total = 0;
+    /* iterate all tiles and force hydrology computations */
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            /* compute flow end (memoized inside), accumulation and water mask */
+            DetermineFlowEnd(planet_name, x, y);
+            ComputeAccumulation(planet_name, x, y);
+            DetermineWaterMask(planet_name, x, y);
+            total++;
+        }
+    }
+
+    /* optionally export to file for debugging */
+    if (export_to_file) {
+        string fname = "/tmp/" + planet_name + "_water.txt";
+        string out = ExportWaterMask(planet_name, fname);
+        if (!out) return total; /* baked but export failed */
+    }
+
+    return total;
+}
+
+/* Export the water mask as ASCII to provided filename.
+   Format: rows top-to-bottom (y=0..h-1), columns left-to-right (x=0..w-1).
+   Characters: '~' ocean, 'r' river, 'l' lake, '.' land.
+   Returns filename on success, 0 on error.
+*/
+string ExportWaterMask(string planet_name, string filename) {
+    mapping P = Planets[planet_name];
+    if (!mapp(P)) return 0;
+    int w = P["width"], h = P["height"];
+    string ph = planet_hash(P);
+
+    string buf = "";
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            string wm = DetermineWaterMask(planet_name, x, y);
+            string ch = ".";
+            if (wm == "ocean") ch = "~";
+            else if (wm == "river") ch = "r";
+            else if (wm == "lake") ch = "l";
+            buf += ch;
+        }
+        buf += "\n";
+    }
+
+    if (!filename) filename = "/tmp/" + planet_name + "_water.txt";
+    if (catch(write_file(filename, buf))) return 0;
+    return filename;
+}
+
+void BakeAndSave(string planet_name) {
+    int count = BakeHydrology(planet_name, 1);
+    mapping P = Planets[planet_name];
+    if (!mapp(P)) return;
+    string ph = planet_hash(P);
+    save_planet_deltas(ph);
+    return;
+}
+
+/* -------------------------
+   Cache & admin helpers
+   ------------------------- */
+void ClearCaches(string planet_name) {
+    if (!stringp(planet_name)) {
+        value_cache = ([]); flow_cache = ([]); accum_cache = ([]); water_mask = ([]);
+        return;
+    }
+    mapping P = Planets[planet_name];
+    if (!mapp(P)) return;
+    string ph = planet_hash(P);
+    foreach (string k in keys(value_cache)) if (strsrch(k, ph + ":") == 0) map_delete(value_cache, k);
+    foreach (string k in keys(flow_cache)) if (strsrch(k, ph + ":") == 0) map_delete(flow_cache, k);
+    foreach (string k in keys(accum_cache)) if (strsrch(k, ph + ":") == 0) map_delete(accum_cache, k);
+    foreach (string k in keys(water_mask)) if (strsrch(k, ph + ":") == 0) map_delete(water_mask, k);
+}
 
 void ShowTile(string planet_name, int x, int y) {
     mapping d = GetRoomData(planet_name, x, y);
@@ -743,21 +694,6 @@ void ShowTile(string planet_name, int x, int y) {
     }
 }
 
-/* clear caches (useful during dev) */
-void ClearCaches(string planet_name) {
-    if (!stringp(planet_name)) {
-        value_cache = ([]); flow_cache = ([]); accum_cache = ([]); water_mask = ([]);
-        return;
-    }
-    mapping P = Planets[planet_name];
-    if (!mapp(P)) return;
-    string ph = planet_hash(P);
-    foreach (string k in keys(value_cache)) if (strsrch(k, ph + ":") == 0) map_delete(value_cache, k);
-    foreach (string k in keys(flow_cache)) if (strsrch(k, ph + ":") == 0) map_delete(flow_cache, k);
-    foreach (string k in keys(accum_cache)) if (strsrch(k, ph + ":") == 0) map_delete(accum_cache, k);
-    foreach (string k in keys(water_mask)) if (strsrch(k, ph + ":") == 0) map_delete(water_mask, k);
-}
-
 /* -------------------------
-   End of daemon
+   End of planetmap.c
    ------------------------- */
