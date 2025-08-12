@@ -19,6 +19,8 @@ protected void create() {
                 ]) );
     SetSkyDomain("town");
     SetExits( ([
+
+                "up" : "/domains/overland/virtual/server:0,0,earthlike",
                 "south" : "/domains/town/room/south_road1",
                 "east" : "/domains/town/room/vill_road2",
                 "west" : "/domains/town/room/road1",
