@@ -136,3 +136,9 @@ string GetBiome(int x, int y, string planet) {
     }
     return "unknown";
 }
+
+mapping GetPlanet(string planet) {
+    if (!planets[planet]) planet = DEFAULT_PLANET;
+    return planets[planet];
+}
+
