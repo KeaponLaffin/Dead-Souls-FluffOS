@@ -1,174 +1,151 @@
-// /daemon/planetmap.c
-// Procedural overland planet generator with delta layers
-// Written for Dead Souls Mudlib
+/* /daemon/planetmap.c
+   Procedural planet generator with deltas + hydrology (rivers/lakes)
+   For Dead Souls MUD
+
+   Features:
+   - Per-planet procedural height, moisture, temperature, biome.
+   - Permanent + temporary delta layers saved per-planet.
+   - Hydrology: flow target, flow accumulation, river and lake detection.
+   - Simple memoization caches for performance.
+   - Admin helpers to inspect tiles.
+
+   Notes:
+   - This version uses simple Perlin-like noise functions (good for prototyping).
+   - Hydrology algorithm: each tile points to the lowest adjacent neighbor (8-way).
+     Flow accumulation is the number of upstream tiles whose path passes through that tile.
+     If a flow path reaches sea -> drained. If flow path enters a loop/not reaching sea -> basin/lake.
+     River tiles are those whose accumulation >= RIVER_ACCUM_THRESHOLD.
+   - For very large planets consider chunking / LRU caching later.
+*/
 
 #include <lib.h>
-#include <save.h>
-#include <daemons.h>
-
 inherit LIB_DAEMON;
 
-#define PERMA_SAVE_DIR "/save/planetmap_perma/"
-#define TEMP_SAVE_DIR  "/save/planetmap_temp/"
+#define PI 3.141592653589793
+#define SAVE_DIR "/save/planetmap/"
+#define PERMA_PREFIX "perma_"
+#define TEMP_PREFIX  "temp_"
 
-// Planet definitions
-mapping Planets = ([]); // planet_id : ([ params ])
-mapping PermanentDeltas = ([]); // planet_id : ([ "x:y" : mapping ])
-mapping TemporaryDeltas = ([]); // planet_id : ([ "x:y" : mapping ])
+/* tuning constants */
+#define DEFAULT_OCTAVES 5
+#define RIVER_ACCUM_THRESHOLD 40  /* upstream tiles required to mark tile as a river */
+#define MAX_FLOW_RECURSION 10000  /* protect DFS from pathological loops */
 
-// Utility — make sure dirs exist
-static void CheckDirs() {
-    if (file_size(PERMA_SAVE_DIR) != -2) mkdir(PERMA_SAVE_DIR);
-    if (file_size(TEMP_SAVE_DIR) != -2) mkdir(TEMP_SAVE_DIR);
-}
+/* persistent storage */
+private mapping Planets;         /* planet_id -> params mapping */
+private mapping PermanentDeltas; /* planet_hash -> mapping("x,y" -> mapping) */
+private mapping TemporaryDeltas; /* planet_hash -> mapping("x,y" -> mapping) */
 
-// Hash planet type + seed for save filenames
-string HashPlanet(string type, int seed) {
-    string raw = type + ":" + seed;
-    string hashed = crypt(raw, "pm");
-    return lower_case(replace_string(hashed[2..9], "/", "x"));
-}
-
-// Save + load helpers
-void SavePlanetData(string planet_id) {
-    string perma_file = PERMA_SAVE_DIR + planet_id + ".o";
-    string temp_file  = TEMP_SAVE_DIR  + planet_id + ".o";
-    unguarded( (: save_object, perma_file, PermanentDeltas[planet_id] :) );
-    unguarded( (: save_object, temp_file,  TemporaryDeltas[planet_id] :) );
-}
-
-void LoadPlanetData(string planet_id) {
-    string perma_file = PERMA_SAVE_DIR + planet_id + ".o";
-    string temp_file  = TEMP_SAVE_DIR  + planet_id + ".o";
-    if (file_size(perma_file) > 0) {
-        unguarded( (: restore_object, perma_file, PermanentDeltas[planet_id] :) );
-    } else PermanentDeltas[planet_id] = ([]);
-    if (file_size(temp_file) > 0) {
-        unguarded( (: restore_object, temp_file, TemporaryDeltas[planet_id] :) );
-    } else TemporaryDeltas[planet_id] = ([]);
-}
-
-// Register a new planet
-void NewPlanet(string type, int seed, mapping params) {
-    string pid = HashPlanet(type, seed);
-    params["type"] = type;
-    params["seed"] = seed;
-    Planets[pid] = params;
-    LoadPlanetData(pid);
-}
-
-// Placeholder noise functions — replace with Perlin later
-float Noise2D(int x, int y, int seed) {
-    return to_float((x * 92837111 ^ y * 689287499 ^ seed) & 0x7fffffff) / 2147483647.0;
-}
-
-float SmoothNoise(int x, int y, int seed) {
-    return (Noise2D(x-1,y-1,seed) + Noise2D(x+1,y-1,seed) +
-            Noise2D(x-1,y+1,seed) + Noise2D(x+1,y+1,seed)) / 4.0;
-}
-
-// Get elevation (-1.0 to 1.0)
-float GetElevation(string pid, int x, int y) {
-    int seed = Planets[pid]["seed"];
-    return (SmoothNoise(x,y,seed) * 2.0) - 1.0;
-}
-
-// Get moisture (0.0 to 1.0)
-float GetMoisture(string pid, int x, int y) {
-    int seed = Planets[pid]["seed"] + 99999;
-    return Noise2D(x,y,seed);
-}
-
-// Get latitude (-90 to 90)
-float GetLatitude(string pid, int y) {
-    int radius = Planets[pid]["radius"];
-    return ((to_float(y) / radius) * 180.0) - 90.0;
-}
-
-// Get base temperature from latitude & axial tilt
-float GetTemperature(string pid, int y) {
-    float axial = Planets[pid]["axial_tilt"];
-    float lat = GetLatitude(pid, y);
-    // simple cosine-based temp curve
-    float temp = cos((lat + axial) * 3.14159 / 180.0);
-    return temp; // normalized 0-1
-}
-
-// Determine biome based on elevation, moisture, temperature
-string ProceduralBiome(string pid, int x, int y) {
-    float elev = GetElevation(pid,x,y);
-    float moist = GetMoisture(pid,x,y);
-    float temp = GetTemperature(pid,y);
-
-    // Simple rules — tweak later
-    if (elev < -0.2) return "ocean";
-    if (elev < 0.0) return "coast";
-    if (temp > 0.8) {
-        if (moist < 0.3) return "desert";
-        else return "tropical_forest";
-    }
-    if (temp > 0.5) {
-        if (moist < 0.4) return "savanna";
-        else return "temperate_forest";
-    }
-    if (temp > 0.3) return "taiga";
-    return "tundra";
-}
-
-// Get biome with deltas applied
-string GetBiome(string pid, int x, int y) {
-    string key = x + ":" + y;
-    if (PermanentDeltas[pid] && PermanentDeltas[pid][key] && PermanentDeltas[pid][key]["biome"]) {
-        return PermanentDeltas[pid][key]["biome"];
-    }
-    // Seasonal modifier hook could go here
-    return ProceduralBiome(pid,x,y);
-}
-
-// Get room data (biome, elevation, moisture, temp, deltas)
-mapping GetRoomData(string pid, int x, int y) {
-    mapping data = ([
-        "biome" : GetBiome(pid,x,y),
-        "elev"  : GetElevation(pid,x,y),
-        "moist" : GetMoisture(pid,x,y),
-        "temp"  : GetTemperature(pid,y),
-        "perma" : PermanentDeltas[pid][x+":"+y],
-        "tempd" : TemporaryDeltas[pid][x+":"+y],
-    ]);
-    return data;
-}
-
-// Set permanent delta (terrain/building changes)
-void SetPermanentDelta(string pid, int x, int y, mapping change) {
-    string key = x + ":" + y;
-    if (!PermanentDeltas[pid]) PermanentDeltas[pid] = ([]);
-    PermanentDeltas[pid][key] = change;
-    SavePlanetData(pid);
-}
-
-// Remove permanent delta
-void RemovePermanentDelta(string pid, int x, int y) {
-    string key = x + ":" + y;
-    if (PermanentDeltas[pid]) map_delete(PermanentDeltas[pid], key);
-    SavePlanetData(pid);
-}
-
-// Set temporary delta (mobs/items)
-void SetTemporaryDelta(string pid, int x, int y, mapping change) {
-    string key = x + ":" + y;
-    if (!TemporaryDeltas[pid]) TemporaryDeltas[pid] = ([]);
-    TemporaryDeltas[pid][key] = change;
-    SavePlanetData(pid);
-}
-
-// Remove temporary delta
-void RemoveTemporaryDelta(string pid, int x, int y) {
-    string key = x + ":" + y;
-    if (TemporaryDeltas[pid]) map_delete(TemporaryDeltas[pid], key);
-    SavePlanetData(pid);
-}
+/* runtime caches (not persisted) */
+private mapping value_cache;     /* key -> numeric value (height/temp/moist/...) */
+private mapping flow_cache;      /* "ph:x,y" -> ({ tx, ty }) or "sea" or "loop" or "pool" */
+private mapping accum_cache;     /* "ph:x,y" -> integer accumulation count */
+private mapping water_mask;      /* "ph:x,y" -> "river"/"lake"/0 */
 
 static void create() {
     daemon::create();
-    CheckDirs();
+    Planets = ([]);
+    PermanentDeltas = ([]);
+    TemporaryDeltas = ([]);
+    value_cache = ([]);
+    flow_cache = ([]);
+    accum_cache = ([]);
+    water_mask = ([]);
+
+    /* make save dir if missing */
+    if (file_size(SAVE_DIR) != -2) mkdir(SAVE_DIR);
+
+    /* default planets (example); use AddPlanet to add your own */
+    AddPlanet("earthlike", ([
+        "type"        : "earthlike",
+        "seed"        : 42,
+        "width"       : 400,
+        "height"      : 200,
+        "axial_tilt"  : 23.5,
+        "sea_level"   : 0.50,
+        "base_temp"   : 15.0,
+        "max_elev_m"  : 8000,
+        "lapse_rate"  : 6.5,
+        "noise_scale" : 0.007,
+        "moisture_scale": 0.02,
+        "moisture_sea_influence_radius": 24,
+    ]));
+
+    AddPlanet("hot_desert", ([
+        "type"        : "hot_desert",
+        "seed"        : 777,
+        "width"       : 300,
+        "height"      : 150,
+        "axial_tilt"  : 10.0,
+        "sea_level"   : 0.20,
+        "base_temp"   : 30.0,
+        "max_elev_m"  : 6000,
+        "lapse_rate"  : 6.0,
+        "noise_scale" : 0.01,
+        "moisture_scale": 0.03,
+        "moisture_sea_influence_radius": 18,
+    ]));
 }
+
+/* -------------------------
+   Persistence helpers: per-planet saves for deltas
+   ------------------------- */
+
+string planet_hash(mapping P) {
+    if (!mapp(P)) return "none";
+    string raw = P["type"] + ":" + to_string(P["seed"]);
+    unsigned long h = 2166136261UL;
+    for (int i = 0; i < strlen(raw); i++) {
+        h ^= (unsigned long)raw[i];
+        h *= 16777619UL;
+    }
+    return sprintf("%08x", h & 0xffffffff);
+}
+
+string perma_file_for(string phash) { return SAVE_DIR + PERMA_PREFIX + phash; }
+string temp_file_for(string phash)  { return SAVE_DIR + TEMP_PREFIX + phash; }
+
+void save_planet_deltas(string phash) {
+    if (!stringp(phash)) return;
+    if (!mapp(PermanentDeltas[phash])) PermanentDeltas[phash] = ([]);
+    if (!mapp(TemporaryDeltas[phash])) TemporaryDeltas[phash] = ([]);
+    save_object(perma_file_for(phash));
+    save_object(temp_file_for(phash));
+}
+
+void load_planet_deltas(string phash) {
+    string pf = perma_file_for(phash) + ".o";
+    string tf = temp_file_for(phash) + ".o";
+    if (file_size(pf) > 0) restore_object(perma_file_for(phash));
+    else PermanentDeltas[phash] = ([]);
+    if (file_size(tf) > 0) restore_object(temp_file_for(phash));
+    else TemporaryDeltas[phash] = ([]);
+}
+
+/* -------------------------
+   Planet management
+   ------------------------- */
+
+mixed AddPlanet(string name, mapping params) {
+    if (!stringp(name) || !mapp(params)) return 0;
+    /* normalize params: require seed,width,height */
+    if (!params["seed"]) params["seed"] = 0;
+    if (!params["width"] || !params["height"]) return 0;
+    params["type"] = name;
+    Planets[name] = params;
+    string ph = planet_hash(params);
+    if (!mapp(PermanentDeltas[ph])) PermanentDeltas[ph] = ([]);
+    if (!mapp(TemporaryDeltas[ph])) TemporaryDeltas[ph] = ([]);
+    load_planet_deltas(ph);
+    /* clear caches touching this planet */
+    foreach (string k in keys(value_cache)) {
+        if (strsrch(k, ph + ":") == 0) map_delete(value_cache, k);
+    }
+    foreach (string k in keys(flow_cache)) {
+        if (strsrch(k, ph + ":") == 0) map_delete(flow_cache, k);
+    }
+    foreach (string k in keys(accum_cache)) {
+        if (strsrch(k, ph + ":") == 0) map_delete(accum_cache, k);
+    }
+    foreach (string k in keys(water_mask)) {
+        if (strsrch(k, ph + ":") == 0) map_delete(water_mask, k
